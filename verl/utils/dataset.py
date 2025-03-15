@@ -29,6 +29,18 @@ from transformers import PreTrainedTokenizer, ProcessorMixin
 from ..models.transformers.qwen2_vl import get_rope_index
 from . import torch_functional as VF
 
+IMAGE_FACTOR = 28
+MIN_PIXELS = 4 * 28 * 28
+MAX_PIXELS = 16384 * 28 * 28
+MAX_RATIO = 200
+
+VIDEO_MIN_PIXELS = 128 * 28 * 28
+VIDEO_MAX_PIXELS = 768 * 28 * 28
+FRAME_FACTOR = 2
+FPS = 2.0
+FPS_MIN_FRAMES = 4
+FPS_MAX_FRAMES = 768
+
 
 def collate_fn(features: List[Dict[str, Any]]) -> Dict[str, Any]:
     tensors = defaultdict(list)
@@ -124,6 +136,7 @@ class RLHFDataset(Dataset):
 
         if self.image_key in row_dict:
             prompt = prompt.replace("<image>", "<|vision_start|><|image_pad|><|vision_end|>")
+            print("here: ", row_dict.pop(self.image_key), self.image_key)
             row_dict["multi_modal_data"] = {
                 "image": [
                     process_image(image, self.max_pixels, self.min_pixels) for image in row_dict.pop(self.image_key)
@@ -139,6 +152,24 @@ class RLHFDataset(Dataset):
                 image_grid_thw=model_inputs["image_grid_thw"],
                 attention_mask=attention_mask,
             )  # (3, seq_length)
+        elif self.video_key in row_dict:
+            prompt = prompt.replace("<video>", "<|vision_start|><|video_pad|><|vision_end|>")
+            video_inputs = []
+            video_input, video_sample_fps = fetch_video(vision_info, return_video_sample_fps=True)
+            video_sample_fps_list.append(video_sample_fps)
+            video_inputs.append(video_input)
+
+            model_inputs = self.processor(video_inputs, prompt, return_tensors="pt")
+            input_ids = model_inputs.pop("input_ids")[0]
+            attention_mask = model_inputs.pop("attention_mask")[0]
+            row_dict["multi_modal_inputs"] = dict(model_inputs)
+            position_ids = get_rope_index(
+                self.processor,
+                input_ids=input_ids,
+                video_grid_thw=model_inputs["video_grid_thw"],
+                attention_mask=attention_mask,
+            )  # (3, seq_length)
+
         else:
             model_inputs = self.tokenizer([prompt], add_special_tokens=False, return_tensors="pt")
             input_ids = model_inputs.pop("input_ids")[0]
@@ -160,3 +191,61 @@ class RLHFDataset(Dataset):
         row_dict["raw_prompt_ids"] = self.tokenizer.encode(prompt, add_special_tokens=False)
         row_dict["ground_truth"] = row_dict.pop(self.answer_key)
         return row_dict
+
+    def fetch_video(ele: dict, image_factor: int = IMAGE_FACTOR,
+                    return_video_sample_fps: bool = False) -> torch.Tensor | list[Image.Image]:
+        if isinstance(ele["video"], str):
+            video_reader_backend = get_video_reader_backend()
+            try:
+                video, sample_fps = VIDEO_READER_BACKENDS[video_reader_backend](ele)
+            except Exception as e:
+                logger.warning(
+                    f"video_reader_backend {video_reader_backend} error, use torchvision as default, msg: {e}")
+                video, sample_fps = VIDEO_READER_BACKENDS["torchvision"](ele)
+
+            nframes, _, height, width = video.shape
+            min_pixels = ele.get("min_pixels", VIDEO_MIN_PIXELS)
+            total_pixels = ele.get("total_pixels", VIDEO_TOTAL_PIXELS)
+            max_pixels = max(min(VIDEO_MAX_PIXELS, total_pixels / nframes * FRAME_FACTOR), int(min_pixels * 1.05))
+            max_pixels_supposed = ele.get("max_pixels", max_pixels)
+            if max_pixels_supposed > max_pixels:
+                logger.warning(f"The given max_pixels[{max_pixels_supposed}] exceeds limit[{max_pixels}].")
+            max_pixels = min(max_pixels_supposed, max_pixels)
+            if "resized_height" in ele and "resized_width" in ele:
+                resized_height, resized_width = smart_resize(
+                    ele["resized_height"],
+                    ele["resized_width"],
+                    factor=image_factor,
+                )
+            else:
+                resized_height, resized_width = smart_resize(
+                    height,
+                    width,
+                    factor=image_factor,
+                    min_pixels=min_pixels,
+                    max_pixels=max_pixels,
+                )
+            video = transforms.functional.resize(
+                video,
+                [resized_height, resized_width],
+                interpolation=InterpolationMode.BICUBIC,
+                antialias=True,
+            ).float()
+            if return_video_sample_fps:
+                return video, sample_fps
+            return video
+        else:
+            assert isinstance(ele["video"], (list, tuple))
+            process_info = ele.copy()
+            process_info.pop("type", None)
+            process_info.pop("video", None)
+            images = [
+                fetch_image({"image": video_element, **process_info}, size_factor=image_factor)
+                for video_element in ele["video"]
+            ]
+            nframes = ceil_by_factor(len(images), FRAME_FACTOR)
+            if len(images) < nframes:
+                images.extend([images[-1]] * (nframes - len(images)))
+            if return_video_sample_fps:
+                return images, process_info.pop("fps", 2.0)
+            return images
